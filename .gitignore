@@ -1,0 +1,26 @@
+# Entorno virtual
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Artefactos generados (modelo, resultados y monitoreo se regeneran con los scripts)
+artefactos/
+
+# Pruebas y análisis de calidad
+.pytest_cache/
+.coverage
+coverage.xml
+test-results.xml
+htmlcov/
+.scannerwork/
+
+# Sistema operativo / editores
+.DS_Store
+Thumbs.db
+.vscode/
