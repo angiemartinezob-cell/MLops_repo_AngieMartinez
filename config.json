@@ -1,1 +1,40 @@
+{
+    "datos": {
+        "ruta": "Base_de_datos.csv",
+        "separador": ";",
+        "variable_objetivo": "Pago_atiempo",
+        "clase_riesgo": 0,
+        "columna_fecha": "fecha_prestamo"
+    },
+    "entrenamiento": {
+        "test_size": 0.2,
+        "random_state": 42,
+        "cv_folds": 5,
+        "metrica_seleccion": "pr_auc"
+    },
+    "artefactos": {
+        "carpeta": "artefactos",
+        "modelo": "artefactos/modelo_final.joblib",
+        "resultados": "artefactos/resultados",
+        "monitoreo": "artefactos/monitoreo"
+    },
+    "monitoreo": {
+        "fecha_corte_referencia": "2025-04-01",
+        "frecuencia": "M",
+        "tamano_muestra": 500,
+        "minimo_registros_periodo": 50,
+        "bins": 10,
+        "alfa": 0.05,
+        "psi_alerta": 0.1,
+        "psi_critico": 0.25,
+        "js_alerta": 0.02,
+        "js_critico": 0.05,
+        "porcentaje_variables_criticas": 0.2
+    },
+    "api": {
+        "host": "0.0.0.0",
+        "puerto": 8000,
+        "max_registros_por_lote": 10000
+    }
+}
 
