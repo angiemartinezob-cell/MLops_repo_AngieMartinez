@@ -1,226 +1,337 @@
-import pandas as pd
+"""
+Ingeniería de características.
+
+Primera componente del flujo de creación del modelo. Toma los datos tal como
+llegan de la fuente, aplica la limpieza definida en el EDA, crea las variables
+derivadas y construye el pipeline de preprocesamiento. Devuelve los conjuntos
+de entrenamiento y evaluación con los que se entrenan los modelos.
+
+Toda la transformación queda dentro de un único Pipeline de scikit-learn.
+De esta forma el modelo guardado recibe los datos crudos y aplica exactamente
+la misma lógica en entrenamiento, en la API y en el monitoreo.
+"""
+
+import json
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 
-from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import MissingIndicator, SimpleImputer
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, RobustScaler
-from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, RobustScaler
 
-# Librerías necesarias para la ingeniería de características,
-# separación de los datos y construcción del pipeline de preprocesamiento.
+
+RAIZ_PROYECTO = Path(__file__).resolve().parent.parent
+RUTA_CONFIG = RAIZ_PROYECTO / "config.json"
+
+VARIABLE_OBJETIVO = "Pago_atiempo"
+
+# Columnas que debe traer cada registro que llega al modelo (datos crudos).
+# puntaje y saldo_mora_codeudor se aceptan si vienen, pero se descartan.
+COLUMNAS_ENTRADA = [
+    "tipo_credito",
+    "fecha_prestamo",
+    "capital_prestado",
+    "plazo_meses",
+    "edad_cliente",
+    "tipo_laboral",
+    "salario_cliente",
+    "total_otros_prestamos",
+    "cuota_pactada",
+    "puntaje_datacredito",
+    "cant_creditosvigentes",
+    "huella_consulta",
+    "saldo_mora",
+    "saldo_total",
+    "saldo_principal",
+    "creditos_sectorFinanciero",
+    "creditos_sectorCooperativo",
+    "creditos_sectorReal",
+    "promedio_ingresos_datacredito",
+    "tendencia_ingresos",
+]
+
+COLUMNAS_NUMERICAS_ORIGEN = [
+    "capital_prestado",
+    "plazo_meses",
+    "edad_cliente",
+    "salario_cliente",
+    "total_otros_prestamos",
+    "cuota_pactada",
+    "puntaje_datacredito",
+    "cant_creditosvigentes",
+    "huella_consulta",
+    "saldo_mora",
+    "saldo_total",
+    "saldo_principal",
+    "creditos_sectorFinanciero",
+    "creditos_sectorCooperativo",
+    "creditos_sectorReal",
+    "promedio_ingresos_datacredito",
+]
+
+# Variables monetarias: no tienen valores negativos y en el EDA mostraron
+# asimetría fuerte a la derecha, por eso se les aplica log(1 + x).
+VARIABLES_MONETARIAS = [
+    "capital_prestado",
+    "salario_cliente",
+    "total_otros_prestamos",
+    "cuota_pactada",
+    "saldo_mora",
+    "saldo_total",
+    "saldo_principal",
+    "promedio_ingresos_datacredito",
+    "ratio_cuota_ingreso",
+    "ratio_deuda_ingreso",
+]
+
+VARIABLES_NUMERICAS = [
+    "plazo_meses",
+    "edad_cliente",
+    "puntaje_datacredito",
+    "cant_creditosvigentes",
+    "huella_consulta",
+    "creditos_sectorFinanciero",
+    "creditos_sectorCooperativo",
+    "creditos_sectorReal",
+    "total_creditos_sectores",
+    "registro_atipico",
+]
+
+VARIABLES_CATEGORICAS = [
+    "tipo_credito",
+    "tipo_laboral",
+    "tendencia_ingresos",
+]
+
+# Variables a las que se les agrega una marca de nulo. Se deja una sola por
+# cada grupo de nulos que coinciden en las mismas filas:
+# - saldo_mora y saldo_total son nulos en los mismos 156 registros.
+# - ratio_cuota_ingreso y ratio_deuda_ingreso son nulos cuando el salario es 0.
+# - promedio_ingresos_datacredito es nulo en las mismas filas que
+#   tendencia_ingresos, que ya tiene la categoría 'Sin_informacion'.
+VARIABLES_INDICADOR_NULO = [
+    "saldo_mora",
+    "saldo_principal",
+    "puntaje_datacredito",
+    "ratio_cuota_ingreso",
+]
+
+CATEGORIAS_TENDENCIA = ["Decreciente", "Estable", "Creciente"]
+EDAD_MAXIMA_VALIDA = 100
+
+
+def cargar_config(ruta=RUTA_CONFIG):
+    """Lee los parámetros del proyecto desde config.json."""
+    with open(ruta, encoding="utf-8") as archivo:
+        return json.load(archivo)
+
+
+def ruta_proyecto(ruta_relativa):
+    """Convierte una ruta del config en una ruta absoluta desde la raíz."""
+    return RAIZ_PROYECTO / ruta_relativa
+
+
+def cargar_datos(ruta=None, separador=";"):
+    """Carga la base de datos de ejemplo (en producción vendría del DWH)."""
+    if ruta is None:
+        config = cargar_config()
+        ruta = ruta_proyecto(config["datos"]["ruta"])
+        separador = config["datos"]["separador"]
+    return pd.read_csv(ruta, sep=separador)
+
+
+def _a_numerico(serie):
+    """Convierte a número aceptando coma decimal (ej. '95,22')."""
+    if pd.api.types.is_numeric_dtype(serie):
+        return serie.astype(float)
+    texto = serie.astype("string").str.strip().str.replace(",", ".", regex=False)
+    return pd.to_numeric(texto, errors="coerce")
+
 
 def limpiar_datos(df):
+    """Limpieza identificada durante el EDA."""
     df = df.copy()
 
-    # tipo_credito representa códigos de categorías, no una cantidad numérica
-    df['tipo_credito'] = df['tipo_credito'].astype(str)
+    # Si un registro no trae alguna columna (por ejemplo desde la API),
+    # se crea vacía para que el imputador la trate como faltante.
+    for columna in COLUMNAS_ENTRADA:
+        if columna not in df.columns:
+            df[columna] = np.nan
 
-    # Se conservan únicamente las categorías válidas de tendencia_ingresos.
-    # Los demás valores quedan como nulos para ser tratados posteriormente.
-    categorias_validas = ['Decreciente', 'Estable', 'Creciente']
+    for columna in COLUMNAS_NUMERICAS_ORIGEN:
+        df[columna] = _a_numerico(df[columna])
 
-    df.loc[
-        ~df['tendencia_ingresos'].isin(categorias_validas)
-        & df['tendencia_ingresos'].notna(),
-        'tendencia_ingresos'
-    ] = np.nan
+    # tipo_credito es un código de categoría, no una cantidad.
+    # Se pasa por número para que 4, 4.0 y '4' queden como la misma categoría.
+    codigo = _a_numerico(df["tipo_credito"])
+    df["tipo_credito"] = codigo.map(
+        lambda valor: str(int(valor)) if pd.notna(valor) else np.nan
+    ).astype(object)
+
+    df["tipo_laboral"] = df["tipo_laboral"].astype(object)
+
+    # tendencia_ingresos solo acepta tres categorías; los números que
+    # aparecían mezclados en la columna se dejan como nulos.
+    tendencia = df["tendencia_ingresos"].astype(object)
+    df["tendencia_ingresos"] = tendencia.where(
+        tendencia.isin(CATEGORIAS_TENDENCIA), np.nan
+    )
 
     return df
-
 
 
 def crear_features_derivados(df):
+    """Atributos calculados propuestos en el EDA."""
     df = df.copy()
 
-    # Relación entre la cuota mensual y el salario del cliente.
-    # Se evita dividir por cero en los casos donde salario_cliente = 0.
-    df['ratio_cuota_ingreso'] = np.where(
-        df['salario_cliente'] > 0,
-        df['cuota_pactada'] / df['salario_cliente'],
-        np.nan
+    salario_valido = df["salario_cliente"] > 0
+
+    # Parte del salario comprometida con la cuota del crédito.
+    df["ratio_cuota_ingreso"] = np.where(
+        salario_valido, df["cuota_pactada"] / df["salario_cliente"], np.nan
     )
 
-    # Relación entre otros préstamos y el salario del cliente.
-    df['ratio_deuda_ingreso'] = np.where(
-        df['salario_cliente'] > 0,
-        df['total_otros_prestamos'] / df['salario_cliente'],
-        np.nan
+    # Nivel de endeudamiento con otros préstamos frente al salario.
+    df["ratio_deuda_ingreso"] = np.where(
+        salario_valido, df["total_otros_prestamos"] / df["salario_cliente"], np.nan
     )
 
-    # Total de créditos reportados en los diferentes sectores.
-    df['total_creditos_sectores'] = (
-        df['creditos_sectorFinanciero']
-        + df['creditos_sectorCooperativo']
-        + df['creditos_sectorReal']
+    # Total de créditos reportados en los tres sectores.
+    df["total_creditos_sectores"] = (
+        df["creditos_sectorFinanciero"]
+        + df["creditos_sectorCooperativo"]
+        + df["creditos_sectorReal"]
     )
+
+    # Bloque de 150 registros con edad > 100, puntaje Datacrédito en 0 y
+    # sin información de ingresos. Se marca en lugar de eliminarse porque
+    # tiene una tasa de no pago diferente al resto.
+    df["registro_atipico"] = (df["edad_cliente"] > EDAD_MAXIMA_VALIDA).astype(int)
 
     return df
 
-def preparar_variables(X):
-    X = X.copy()
 
-    # Conversión de fecha
-    X['fecha_prestamo'] = pd.to_datetime(
-        X['fecha_prestamo'],
-        errors='coerce',
-        dayfirst=True
-    )
+def transformar_variables(df):
+    """
+    Paso completo de datos crudos a variables del modelo.
 
-    # Atributos derivados de la fecha
-    X['anio_prestamo'] = X['fecha_prestamo'].dt.year
+    Se usa dentro del Pipeline mediante FunctionTransformer, por lo que debe
+    estar definida a nivel de módulo para poder guardarse con joblib.
+    """
+    df = limpiar_datos(df)
+    df = crear_features_derivados(df)
+    return df[VARIABLES_MONETARIAS + VARIABLES_NUMERICAS + VARIABLES_CATEGORICAS]
 
-    # El mes se trata como categoría y no como una cantidad numérica
-    X['mes_prestamo'] = (
-        X['fecha_prestamo']
-        .dt.month
-        .astype('string')
-    )
 
-    # La fecha original no se utiliza directamente en el modelo
-    X = X.drop(columns=['fecha_prestamo'])
+def construir_preprocesador():
+    """ColumnTransformer con un pipeline por tipo de variable."""
+    pipeline_monetario = Pipeline(steps=[
+        ("imputacion", SimpleImputer(strategy="median")),
+        ("log", FunctionTransformer(np.log1p, feature_names_out="one-to-one")),
+        ("escalado", RobustScaler()),
+    ])
 
-    # Se excluye puntaje del modelo principal hasta validar
-    # cómo fue construido y descartar posible fuga de información
-    X = X.drop(columns=['puntaje'])
+    pipeline_numerico = Pipeline(steps=[
+        ("imputacion", SimpleImputer(strategy="median")),
+        ("escalado", RobustScaler()),
+    ])
 
-    return X
+    # Los nulos de tendencia_ingresos son el 28 %; imputarlos con la moda los
+    # convertiría en 'Creciente'. Se dejan como una categoría propia.
+    # Categorías con menos de 20 registros (tipo_credito 7 y 68) se agrupan.
+    pipeline_categorico = Pipeline(steps=[
+        ("imputacion", SimpleImputer(strategy="constant", fill_value="Sin_informacion")),
+        ("codificacion", OneHotEncoder(
+            handle_unknown="infrequent_if_exist",
+            min_frequency=20,
+            sparse_output=False,
+        )),
+    ])
+
+    # En el EDA los nulos de saldos y de Datacrédito mostraron más no pago
+    # (cerca de 7 % frente a 4,7 %), así que se agrega una marca de nulo.
+    # features="all" mantiene siempre las mismas columnas de salida.
+    indicador_nulos = MissingIndicator(features="all")
+
+    return ColumnTransformer(transformers=[
+        ("monetarias", pipeline_monetario, VARIABLES_MONETARIAS),
+        ("numericas", pipeline_numerico, VARIABLES_NUMERICAS),
+        ("nulos", indicador_nulos, VARIABLES_INDICADOR_NULO),
+        ("categoricas", pipeline_categorico, VARIABLES_CATEGORICAS),
+    ])
+
+
+def construir_pipeline_features():
+    """Pipeline de features: datos crudos -> matriz lista para el modelo."""
+    return Pipeline(steps=[
+        ("transformacion", FunctionTransformer(transformar_variables)),
+        ("preprocesamiento", construir_preprocesador()),
+    ])
+
+
+def separar_objetivo(df):
+    """Devuelve X (crudo, sin variables excluidas) e y."""
+    y = df[VARIABLE_OBJETIVO].astype(int)
+    X = df.drop(columns=[VARIABLE_OBJETIVO])
+    return X, y
 
 
 def dividir_datos(df, test_size=0.2, random_state=42):
-    # Limpieza identificada durante el EDA
-    df = limpiar_datos(df)
-
-    # Se crean los atributos derivados
-    df = crear_features_derivados(df)
-
-    # Variable objetivo
-    y = df['Pago_atiempo']
-
-    # Variables predictoras
-    X = df.drop(columns=['Pago_atiempo'])
-
-    # Preparación de variables antes de dividir los datos
-    X = preparar_variables(X)
-
-    # División estratificada para conservar la proporción
-    # entre las clases 0 y 1 en entrenamiento y evaluación
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y
+    """División estratificada para conservar la proporción de clases."""
+    X, y = separar_objetivo(df)
+    return train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    return X_train, X_test, y_train, y_test
 
+def preparar_dataset_modelo(df=None, config=None):
+    """Entrega los conjuntos de entrenamiento/evaluación y el preprocesador."""
+    if config is None:
+        config = cargar_config()
+    if df is None:
+        df = cargar_datos()
 
-def construir_preprocesador(X_train):
-    # Identificación de variables numéricas y categóricas
-    variables_numericas = X_train.select_dtypes(
-        include=[np.number]
-    ).columns.tolist()
-
-    variables_categoricas = X_train.select_dtypes(
-        include=['object', 'category', 'string']
-    ).columns.tolist()
-
-    # Pipeline para variables numéricas
-    pipeline_numerico = Pipeline(steps=[
-        ('imputacion', SimpleImputer(strategy='median')),
-        ('escalado', RobustScaler())
-    ])
-
-    # Pipeline para variables categóricas
-    pipeline_categorico = Pipeline(steps=[
-        ('imputacion', SimpleImputer(strategy='most_frequent')),
-        ('codificacion', OneHotEncoder(
-            handle_unknown='ignore',
-            sparse_output=False
-        ))
-    ])
-
-    # Unión de ambos pipelines
-    preprocesador = ColumnTransformer(
-        transformers=[
-            ('numericas', pipeline_numerico, variables_numericas),
-            ('categoricas', pipeline_categorico, variables_categoricas)
-        ]
-    )
-
-    return preprocesador, variables_numericas, variables_categoricas
-
-
-
-def preparar_dataset_modelo(df, test_size=0.2, random_state=42):
-    # División de los datos en entrenamiento y evaluación
+    parametros = config["entrenamiento"]
     X_train, X_test, y_train, y_test = dividir_datos(
         df,
-        test_size=test_size,
-        random_state=random_state
-    )
-
-    # Construcción del preprocesador utilizando únicamente
-    # el conjunto de entrenamiento
-    preprocesador, variables_numericas, variables_categoricas = (
-        construir_preprocesador(X_train)
+        test_size=parametros["test_size"],
+        random_state=parametros["random_state"],
     )
 
     return {
-        'X_train': X_train,
-        'X_test': X_test,
-        'y_train': y_train,
-        'y_test': y_test,
-        'preprocesador': preprocesador,
-        'variables_numericas': variables_numericas,
-        'variables_categoricas': variables_categoricas
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "pipeline_features": construir_pipeline_features(),
+        "variables_numericas": VARIABLES_MONETARIAS + VARIABLES_NUMERICAS,
+        "variables_categoricas": VARIABLES_CATEGORICAS,
     }
 
 
-
-
 if __name__ == "__main__":
-    # Carga del dataset de ejemplo
-    df = pd.read_csv('Base_de_datos.csv', sep=';')
+    resultado = preparar_dataset_modelo()
 
-    # Preparación de los datos para modelamiento
-    resultado = preparar_dataset_modelo(df)
+    print("Tamaño X_train:", resultado["X_train"].shape)
+    print("Tamaño X_test:", resultado["X_test"].shape)
+    print("Proporción de no pago en train:", round((resultado["y_train"] == 0).mean(), 4))
+    print("Proporción de no pago en test:", round((resultado["y_test"] == 0).mean(), 4))
 
-    # Tamaños de los conjuntos generados
-    print("Tamaño X_train:", resultado['X_train'].shape)
-    print("Tamaño X_test:", resultado['X_test'].shape)
-    print("Tamaño y_train:", resultado['y_train'].shape)
-    print("Tamaño y_test:", resultado['y_test'].shape)
+    print("\nVariables numéricas:", resultado["variables_numericas"])
+    print("Variables categóricas:", resultado["variables_categoricas"])
 
-    # Variables identificadas para cada pipeline
-    print("\nVariables numéricas:")
-    print(resultado['variables_numericas'])
-
-    print("\nVariables categóricas:")
-    print(resultado['variables_categoricas'])
-
-    # Prueba del pipeline de preprocesamiento
-    X_train_transformado = resultado['preprocesador'].fit_transform(
-        resultado['X_train']
-    )
-
-    X_test_transformado = resultado['preprocesador'].transform(
-        resultado['X_test']
-    )
+    pipeline = resultado["pipeline_features"]
+    X_train_transformado = pipeline.fit_transform(resultado["X_train"])
+    X_test_transformado = pipeline.transform(resultado["X_test"])
 
     print("\nDespués del preprocesamiento:")
     print("X_train transformado:", X_train_transformado.shape)
     print("X_test transformado:", X_test_transformado.shape)
-
-    print(
-        "Valores nulos en X_train transformado:",
-        np.isnan(X_train_transformado).sum()
-    )
-
-    print(
-        "Valores nulos en X_test transformado:",
-        np.isnan(X_test_transformado).sum()
-    )
-
-
+    print("Nulos en X_train transformado:", int(np.isnan(X_train_transformado).sum()))
+    print("Nulos en X_test transformado:", int(np.isnan(X_test_transformado).sum()))
+    print("\nColumnas generadas:")
+    print(list(pipeline.named_steps["preprocesamiento"].get_feature_names_out()))
